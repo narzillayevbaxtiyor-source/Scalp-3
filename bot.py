@@ -3,21 +3,46 @@ import json
 import math
 import time
 import re
+import asyncio
 import requests
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
+# ===================== ENV =====================
 BINANCE_BASE = "https://api.binance.com"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()            # sizning shaxsiy chat id yoki group id
-GROUP_ID = os.getenv("GROUP_ID", "").strip()          # HukmCrypto bilan birga turgan GROUP chat_id: -100...
+CHAT_ID_RAW = os.getenv("CHAT_ID", "").strip()          # signal boradigan joy (user id yoki group id)
+GROUP_ID_RAW = os.getenv("GROUP_ID", "").strip()        # HukmCrypto turgan group id (-100...)
 HUKM_BOT_USERNAME = os.getenv("HUKM_BOT_USERNAME", "HukmCrypto_bot").strip().lstrip("@")
 
-# --- Strategy knobs ---
+# Optional: hukm filter OFF qilish uchun USE_HUKM=false
+USE_HUKM = os.getenv("USE_HUKM", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_chat_id(v: str) -> Optional[int]:
+    v = (v or "").strip()
+    if not v:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+CHAT_ID = parse_chat_id(CHAT_ID_RAW)
+GROUP_ID = parse_chat_id(GROUP_ID_RAW)
+
+# ===================== STRATEGY =====================
 TOP_N = 10
 INTERVAL = "3m"
 KLINE_LIMIT = 200
@@ -28,14 +53,17 @@ MIN_REVERSAL_BEAR_OR_DOJI = 1
 DOJI_BODY_TO_RANGE = 0.18
 LEVEL_EPS = 0.0
 
+SCAN_EVERY_SEC = 30  # har 30 sekund tekshiradi (3m uchun normal)
+
 STATE_FILE = "state.json"
 
-# --- Hukm check knobs ---
-HUKM_CACHE_TTL_SEC = 24 * 3600      # 24 soat cache
-HUKM_RATE_LIMIT_SEC = 2.0           # groupga 2 sekundda 1 tadan ko‘p so‘rov yubormaslik
-HUKM_TIMEOUT_SEC = 60               # 60s ichida javob bo‘lmasa, keyingi aylanishda qayta so‘raydi
+# ===================== HUKM SETTINGS =====================
+HUKM_CACHE_TTL_SEC = 24 * 3600   # 24 soat
+HUKM_RATE_LIMIT_SEC = 2.0        # 2s da 1 tadan ko‘p so‘rov yubormaslik
+HUKM_TIMEOUT_SEC = 90            # javob kelmasa 90s dan keyin qayta so‘raydi
 
 
+# ===================== DATA STRUCTURES =====================
 @dataclass
 class Candle:
     open_time: int
@@ -79,10 +107,11 @@ class SignalMemory:
 
 @dataclass
 class HukmVerdict:
-    status: str = "unknown"   # unknown | allowed | blocked
-    updated_at: int = 0       # unix seconds
+    status: str = "unknown"  # unknown | allowed | blocked
+    updated_at: int = 0
 
 
+# ===================== BINANCE CLIENT =====================
 class BinanceClient:
     def __init__(self):
         self.s = requests.Session()
@@ -99,6 +128,7 @@ class BinanceClient:
         return r.json()
 
 
+# ===================== STATE I/O =====================
 def load_state() -> Tuple[Dict[str, TradeState], Dict[str, SignalMemory], Dict[str, HukmVerdict]]:
     if not os.path.exists(STATE_FILE):
         return {}, {}, {}
@@ -119,10 +149,14 @@ def save_state(trades: Dict[str, TradeState], mem: Dict[str, SignalMemory], hukm
         "mem": {k: asdict(v) for k, v in mem.items()},
         "hukm": {k: asdict(v) for k, v in hukm.items()},
     }
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(raw, f, ensure_ascii=False, indent=2)
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(raw, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
+# ===================== HELPERS =====================
 def parse_klines(kl: List[list]) -> List[Candle]:
     out = []
     for k in kl:
@@ -204,7 +238,6 @@ def find_reversal_block(candles: List[Candle]) -> Optional[dict]:
             continue
 
         last_rev = candles[end]
-
         if last_rev.is_bear():
             return {
                 "level_type": "last_bear_high",
@@ -224,7 +257,7 @@ def find_reversal_block(candles: List[Candle]) -> Optional[dict]:
     return None
 
 
-# --- TradingView screenshot helpers ---
+# ===================== SCREENSHOT =====================
 def tradingview_chart_url(symbol: str, interval: str = "3") -> str:
     return f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}&interval={interval}"
 
@@ -232,7 +265,7 @@ def tradingview_chart_url(symbol: str, interval: str = "3") -> str:
 def fetch_screenshot_bytes(url: str) -> Optional[bytes]:
     """
     Microlink screenshot endpoint (browser kerak emas).
-    Fail bo‘lsa link yuborishga tushadi.
+    Fail bo‘lsa None qaytaradi (link yuboramiz).
     """
     try:
         api = "https://api.microlink.io"
@@ -257,18 +290,19 @@ def fetch_screenshot_bytes(url: str) -> Optional[bytes]:
         return None
 
 
-async def send_signal_with_chart(context: ContextTypes.DEFAULT_TYPE, sym: str, text: str):
+async def send_signal_with_chart(app: Application, sym: str, text: str):
+    if CHAT_ID is None:
+        return
     chart_link = tradingview_chart_url(sym, "3")
     img_bytes = fetch_screenshot_bytes(chart_link)
 
     if img_bytes:
-        await context.bot.send_photo(chat_id=CHAT_ID, photo=img_bytes, caption=text)
+        await app.bot.send_photo(chat_id=CHAT_ID, photo=img_bytes, caption=text)
     else:
-        await context.bot.send_message(chat_id=CHAT_ID, text=text + f"\n\n📈 Chart: {chart_link}")
+        await app.bot.send_message(chat_id=CHAT_ID, text=text + f"\n\n📈 Chart: {chart_link}")
 
 
-# ---------------- HUKM (group-based) ----------------
-
+# ===================== HUKM FILTER =====================
 def hukm_cache_valid(v: HukmVerdict) -> bool:
     if v.status not in ("allowed", "blocked"):
         return False
@@ -277,37 +311,38 @@ def hukm_cache_valid(v: HukmVerdict) -> bool:
 
 def is_muboh_text(txt: str) -> bool:
     t = (txt or "").upper()
-    return "MUBOH" in t or "MUBAH" in t or "مباح" in t or "HALOL" in t or "HALAL" in t
+    return ("MUBOH" in t) or ("MUBAH" in t) or ("مباح" in t) or ("HALOL" in t) or ("HALAL" in t) or ("حلال" in t)
 
 
 def extract_symbol_guess(txt: str) -> Optional[str]:
-    """
-    fallback: matndan BTC/ETH kabi token topishga urinish
-    """
     if not txt:
         return None
+    # BTC, ETH, SOL kabi tokenlarni topish
     m = re.findall(r"\b[A-Z0-9]{2,10}\b", txt.upper())
     if not m:
         return None
-    # eng birinchi token
     return m[0]
 
 
-async def request_hukm_for_symbol(context: ContextTypes.DEFAULT_TYPE, base: str) -> None:
+async def request_hukm_for_symbol(app: Application, base: str) -> None:
     """
-    Guruhga so‘rov yuboradi va message_id -> symbol map saqlaydi.
+    GROUP_ID ga coin yuboradi.
+    pending map saqlaydi: msg_id -> base
     """
-    app = context.application
+    if GROUP_ID is None:
+        return
+
     now = time.time()
     last_sent = app.bot_data.get("hukm_last_sent_at", 0.0)
     if (now - last_sent) < HUKM_RATE_LIMIT_SEC:
         return
 
-    # oddiy so‘rov: faqat symbol (ko‘p botlar shuni tushunadi)
-    msg = await context.bot.send_message(chat_id=GROUP_ID, text=base)
+    # oddiy so‘rov: token nomi
+    msg = await app.bot.send_message(chat_id=GROUP_ID, text=base)
 
     pending_by_msg: Dict[int, str] = app.bot_data["hukm_pending_by_msg"]
     pending_by_sym: Dict[str, int] = app.bot_data["hukm_pending_by_sym"]
+
     pending_by_msg[msg.message_id] = base
     pending_by_sym[base] = int(time.time())
 
@@ -316,39 +351,35 @@ async def request_hukm_for_symbol(context: ContextTypes.DEFAULT_TYPE, base: str)
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Guruhda @HukmCrypto_bot javobini ushlab, MUBOH bo‘lsa coin allowed qiladi.
+    GROUP_ID ichida @HukmCrypto_bot javobini o‘qiydi.
+    'MUBOH' bo‘lsa allowed, bo‘lmasa blocked.
     """
-    if not update.message:
-        return
-
     msg = update.message
-
-    # faqat GROUP_ID ichidagi xabarlar
-    if str(msg.chat_id) != str(GROUP_ID):
+    if not msg:
         return
 
-    # faqat Hukm botdan kelgan xabarlarni o‘qish
-    from_user = msg.from_user
-    if not from_user:
+    if GROUP_ID is None or str(msg.chat_id) != str(GROUP_ID):
         return
 
-    # username tekshiramiz (eng ishonchli)
-    u = (from_user.username or "").lower()
+    if not msg.from_user:
+        return
+
+    u = (msg.from_user.username or "").lower()
     if u != HUKM_BOT_USERNAME.lower():
         return
 
     app = context.application
-    hukm: Dict[str, HukmVerdict] = app.bot_data["hukm_cache"]
+    hukm_cache: Dict[str, HukmVerdict] = app.bot_data["hukm_cache"]
     pending_by_msg: Dict[int, str] = app.bot_data["hukm_pending_by_msg"]
     pending_by_sym: Dict[str, int] = app.bot_data["hukm_pending_by_sym"]
 
     base = None
 
-    # eng yaxshi: reply_to_message orqali aniqlash
+    # eng yaxshi: reply bo‘lsa
     if msg.reply_to_message and msg.reply_to_message.message_id in pending_by_msg:
         base = pending_by_msg[msg.reply_to_message.message_id]
 
-    # fallback: matndan symbol topish
+    # fallback: matndan token topish
     if not base:
         guess = extract_symbol_guess(msg.text or "")
         if guess and guess in pending_by_sym:
@@ -358,56 +389,48 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     verdict = "allowed" if is_muboh_text(msg.text or "") else "blocked"
-    hukm[base] = HukmVerdict(status=verdict, updated_at=int(time.time()))
+    hukm_cache[base] = HukmVerdict(status=verdict, updated_at=int(time.time()))
 
-    # pending’dan tozalash
-    # (reply id bo‘yicha bo‘lsa)
+    # pending tozalash
     if msg.reply_to_message and msg.reply_to_message.message_id in pending_by_msg:
         pending_by_msg.pop(msg.reply_to_message.message_id, None)
     pending_by_sym.pop(base, None)
 
-    # xohlasangiz diagnostika (chatga yubormaymiz) — logga chiqadi:
-    # print(f"HUKM {base} => {verdict}")
+    # persist
+    save_state(app.bot_data["trades"], app.bot_data["mem"], hukm_cache)
 
 
-# ---------------- Telegram commands ----------------
-
+# ===================== COMMANDS =====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Bot ishga tushdi.\n"
-        "/status - holat\n"
-        "/help - qoida\n"
-        "/hukmstatus - hukm cache holati"
+        "✅ Bot ishga tushdi.\n"
+        "/status - trade holat\n"
+        "/hukmstatus - hukm cache\n"
+        "/help - qoida"
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Ishlash tartibi:\n"
-        "0) Top10 chiqadi -> avval GROUP_ID ichida @HukmCrypto_bot dan hukm so‘raydi.\n"
-        "   Javobida 'MUBOH' bo‘lsa -> analiz.\n"
-        "1) Binance Top10 (24h % o'sish) -> 3m klines.\n"
-        "2) Buqa shamlardan keyin reversal (ayiq/doji):\n"
-        "   - oxirgi ayiq sham HIGH yorilsa BUY\n"
-        "   - reversal doji bilan tugasa: keyingi sham doji HIGH yorilsa BUY\n"
-        "3) SL = breakout bo‘lgan sham LOW.\n"
-        "4) TP = BUYdan keyin bullish shamlar davomida: yangi bullish LOW < oldingi bullish LOW bo‘lsa TP.\n"
-        "Signal bilan chart screenshot yuboriladi."
+        "Ishlash:\n"
+        f"- Top{TOP_N} (24h gainers) -> 3m analiz\n"
+        "- (Ixtiyoriy) HukmCrypto: javobida MUBOH bo‘lsa analizga kiradi\n"
+        "Signal qoidasi:\n"
+        "1) Buqa shamlar ketma-ket -> reversal (ayiq/doji)\n"
+        "2) Oxirgi ayiq HIGH yorilsa BUY\n"
+        "3) Reversal doji bilan tugasa: keyingi sham doji HIGH yorilsa BUY\n"
+        "4) SL = breakout sham LOW\n"
+        "5) TP = BUYdan keyin bullish shamlarda: yangi bullish LOW < oldingi bullish LOW bo‘lsa TP\n"
     )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trades: Dict[str, TradeState] = context.application.bot_data.get("trades", {})
-    if not trades:
-        await update.message.reply_text("Hozircha trade state yo'q.")
-        return
     lines = []
     for sym, st in trades.items():
         if st.in_trade:
-            lines.append(
-                f"{sym}: IN_TRADE | entry={fmt(st.entry_level)} | SL={fmt(st.sl)} | last_bull_low={fmt(st.last_bull_low)}"
-            )
-    await update.message.reply_text("\n".join(lines) if lines else "Faol trade yo'q.")
+            lines.append(f"{sym}: IN_TRADE | entry={fmt(st.entry_level)} | SL={fmt(st.sl)} | last_bull_low={fmt(st.last_bull_low)}")
+    await update.message.reply_text("\n".join(lines) if lines else "Faol trade yo‘q.")
 
 
 async def cmd_hukmstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -423,47 +446,49 @@ async def cmd_hukmstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(items[:80]))
 
 
-# ---------------- Main scanning job ----------------
-
-async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
-    app = context.application
+# ===================== CORE SCAN =====================
+async def scan_once(app: Application):
     client: BinanceClient = app.bot_data["binance"]
     trades: Dict[str, TradeState] = app.bot_data["trades"]
     mem: Dict[str, SignalMemory] = app.bot_data["mem"]
     hukm_cache: Dict[str, HukmVerdict] = app.bot_data["hukm_cache"]
     pending_by_sym: Dict[str, int] = app.bot_data["hukm_pending_by_sym"]
 
+    # 1) top gainers
     try:
         tickers = client.get_24h_tickers()
         symbols = top_gainers_usdt(tickers, TOP_N)
     except Exception:
         return
 
-    # 1) Hukm tekshiruv: faqat MUBOH bo‘lganlar analizga kiradi
-    allowed_symbols = []
+    # 2) hukm gating (agar yoqilgan bo‘lsa)
+    allowed_symbols: List[str] = []
     now = int(time.time())
 
     for sym in symbols:
         b = base_asset(sym)
 
-        v = hukm_cache.get(b, HukmVerdict())
-        if hukm_cache_valid(v) and v.status == "allowed":
+        if USE_HUKM and GROUP_ID is not None:
+            v = hukm_cache.get(b, HukmVerdict())
+
+            if hukm_cache_valid(v) and v.status == "allowed":
+                allowed_symbols.append(sym)
+                continue
+
+            if hukm_cache_valid(v) and v.status == "blocked":
+                continue
+
+            # hukm so‘rash
+            last_req = pending_by_sym.get(b, 0)
+            if last_req and (now - last_req) < HUKM_TIMEOUT_SEC:
+                continue
+
+            await request_hukm_for_symbol(app, b)
+        else:
+            # hukm yo‘q: hammasi allowed
             allowed_symbols.append(sym)
-            continue
 
-        # agar blocked bo‘lsa (cache valid) -> skip
-        if hukm_cache_valid(v) and v.status == "blocked":
-            continue
-
-        # cache yo‘q / eskirgan bo‘lsa -> hukm so‘raymiz
-        last_req = pending_by_sym.get(b, 0)
-        if last_req and (now - last_req) < HUKM_TIMEOUT_SEC:
-            continue  # hali javob kutilyapti
-
-        # so‘rov yuborish
-        await request_hukm_for_symbol(context, b)
-
-    # 2) Faqat MUBOH bo‘lganlar analiz
+    # 3) only allowed -> analyze
     for sym in allowed_symbols:
         try:
             kl = client.get_klines(sym, INTERVAL, KLINE_LIMIT)
@@ -485,20 +510,21 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
         st = trades[sym]
         m = mem[sym]
 
-        # ---- Manage open trade ----
+        # ---- manage open trade
         if st.in_trade:
+            # SL
             if last.low <= st.sl:
                 text = (
                     f"🛑 STOP-LOSS HIT\n"
                     f"{sym} ({INTERVAL})\n"
                     f"SL={fmt(st.sl)} | candle_low={fmt(last.low)}"
                 )
-                await send_signal_with_chart(context, sym, text)
+                await send_signal_with_chart(app, sym, text)
                 st.in_trade = False
                 save_state(trades, mem, hukm_cache)
                 continue
 
-            # TP rule
+            # TP: bullish low pasaysa
             if last.is_bull():
                 if st.last_bull_low == 0.0:
                     st.last_bull_low = last.low
@@ -507,11 +533,10 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
                         text = (
                             f"✅ TAKE-PROFIT\n"
                             f"{sym} ({INTERVAL})\n"
-                            f"Bullish candle made LOWER LOW.\n"
                             f"Prev bull low={fmt(st.last_bull_low)} -> New bull low={fmt(last.low)}\n"
                             f"Entry={fmt(st.entry_level)} | SL={fmt(st.sl)}"
                         )
-                        await send_signal_with_chart(context, sym, text)
+                        await send_signal_with_chart(app, sym, text)
                         st.in_trade = False
                     else:
                         st.last_bull_low = last.low
@@ -519,7 +544,7 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
             save_state(trades, mem, hukm_cache)
             continue
 
-        # ---- Find pattern + breakout ----
+        # ---- find pattern
         pattern = find_reversal_block(candles)
         if not pattern:
             continue
@@ -528,32 +553,36 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
         reversal_last_index = pattern["reversal_last_index"]
         level_type = pattern["level_type"]
 
-        next_candle = candles[reversal_last_index + 1]
-        trigger_candle = next_candle
+        # trigger candle: reversal’dan keyingi sham
+        trigger_candle = candles[reversal_last_index + 1]
 
+        # faqat so‘nggi / oldingi yopilgan shamda signal bo‘lsin
         if trigger_candle.close_time not in (last.close_time, prev.close_time):
             continue
 
         if breakout_happened(level, trigger_candle):
+            # duplicate prevention
             if m.last_signal_close_time == trigger_candle.close_time and math.isclose(m.last_level, level, rel_tol=1e-12):
                 continue
 
             entry_level = level
             sl = trigger_candle.low
 
+            tag = " (MUBOH)" if (USE_HUKM and GROUP_ID is not None) else ""
             text = (
-                f"🟢 BUY SIGNAL (MUBOH)\n"
+                f"🟢 BUY SIGNAL{tag}\n"
                 f"{sym} ({INTERVAL})\n"
                 f"Setup: {pattern['pivot_info']}\n"
                 f"Level ({level_type}) = {fmt(level)}\n"
                 f"Break candle: H={fmt(trigger_candle.high)} L={fmt(trigger_candle.low)} C={fmt(trigger_candle.close)}\n"
                 f"✅ BUY = {fmt(entry_level)}\n"
                 f"🛡 SL = {fmt(sl)}\n"
-                f"🎯 TP: bullish candles davomida, yangi bullish LOW < oldingi bullish LOW bo‘lsa TP"
+                f"🎯 TP: bullish candles low pasaysa TP"
             )
 
-            await send_signal_with_chart(context, sym, text)
+            await send_signal_with_chart(app, sym, text)
 
+            # set trade
             st.in_trade = True
             st.entry_level = entry_level
             st.entry_candle_close_time = trigger_candle.close_time
@@ -566,40 +595,61 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
             save_state(trades, mem, hukm_cache)
 
 
+# ===================== BACKGROUND LOOP =====================
+async def scanner_loop(app: Application):
+    # kichik log (Render logs uchun)
+    print("✅ scanner_loop started")
+    while True:
+        try:
+            await scan_once(app)
+        except Exception as e:
+            # bot yiqilmasin
+            print(f"[scanner_loop] error: {e}")
+        await asyncio.sleep(SCAN_EVERY_SEC)
+
+
+async def post_init(app: Application):
+    # background task start
+    if app.bot_data.get("scanner_task") is None:
+        app.bot_data["scanner_task"] = asyncio.create_task(scanner_loop(app))
+        print("✅ background task created")
+
+
+# ===================== MAIN =====================
 def main():
-    if not BOT_TOKEN or not CHAT_ID or not GROUP_ID:
-        raise SystemExit(
-            "Env vars kerak: BOT_TOKEN, CHAT_ID, GROUP_ID.\n"
-            "GROUP_ID - HukmCrypto_bot bilan turgan guruh chat_id (minus bilan)."
-        )
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN env yo‘q.")
+    if CHAT_ID is None:
+        raise SystemExit("CHAT_ID env yo‘q yoki noto‘g‘ri.")
+    # GROUP_ID majburiy emas (USE_HUKM true bo‘lsa tavsiya)
+    if USE_HUKM and GROUP_ID is None:
+        print("⚠️ USE_HUKM=true, lekin GROUP_ID yo‘q. Hukm filter o‘chadi (hammasi analiz).")
 
     trades, mem, hukm = load_state()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # shared objects
+    # shared state
     app.bot_data["binance"] = BinanceClient()
     app.bot_data["trades"] = trades
     app.bot_data["mem"] = mem
-
-    # hukm state (in-memory, plus persisted)
     app.bot_data["hukm_cache"] = hukm
-    app.bot_data["hukm_pending_by_msg"] = {}  # message_id -> symbol
+    app.bot_data["hukm_pending_by_msg"] = {}  # msg_id -> symbol
     app.bot_data["hukm_pending_by_sym"] = {}  # symbol -> last_request_time
     app.bot_data["hukm_last_sent_at"] = 0.0
+    app.bot_data["scanner_task"] = None
 
-    # commands
+    # handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("hukmstatus", cmd_hukmstatus))
 
-    # group message listener (Hukm bot javoblari uchun)
+    # Hukm bot javoblari (group ichida)
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_group_message))
 
-    # scanner
-    app.job_queue.run_repeating(scanner_job, interval=30, first=5)
-
+    # run
+    print("✅ Bot polling starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
