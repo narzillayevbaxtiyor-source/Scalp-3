@@ -412,6 +412,7 @@ async def post_init(app: Application):
     # webhook izlarini tozalash (polling uchun)
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
+        await asyncio.sleep(2)  # ✅ (5-variant) overlapni kamaytiradi
         print("✅ delete_webhook ok")
     except Exception as e:
         print(f"delete_webhook error: {e}")
