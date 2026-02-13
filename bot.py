@@ -91,6 +91,10 @@ def tickers_24h() -> List[dict]:
 def klines(symbol: str, interval: str, limit: int = 200) -> List[list]:
     return _get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
 
+def ticker_price(symbol: str) -> float:
+    j = _get("/api/v3/ticker/price", {"symbol": symbol})
+    return to_f(j.get("price"))
+
 def parse_klines(raw: List[list]) -> Dict[str, List[float]]:
     o = [to_f(k[1]) for k in raw]
     h = [to_f(k[2]) for k in raw]
@@ -100,7 +104,6 @@ def parse_klines(raw: List[list]) -> Dict[str, List[float]]:
     return {"o": o, "h": h, "l": l, "c": c, "v": v}
 
 def trend_hh_hl(h: List[float], l: List[float], lookback: int = 6) -> str:
-    # Juda sodda struktur: HH/HL bo'lsa bullish, LH/LL bo'lsa bearish, aks holda range.
     if len(h) < lookback + 1:
         return "data yetarli emas"
     highs = h[-lookback:]
@@ -124,7 +127,6 @@ def analyze_tf(tf_name: str, data: Dict[str, List[float]]) -> Dict[str, float]:
     vol_ma20 = rolling_mean(v, 20)
     vol_ratio = (v[-1] / vol_ma20) if (vol_ma20 and not math.isnan(vol_ma20) and vol_ma20 != 0) else float("nan")
 
-    # breakout: close above prior N-bar high (excluding last bar)
     N = 55 if tf_name == "1w" else (30 if tf_name == "1d" else 60)
     if len(h) > (N + 1):
         prior_high = max(h[-(N + 1):-1])
@@ -178,9 +180,14 @@ def pick_topN_usdt_spot(n: int) -> List[Tuple[str, float]]:
 def load_state() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            st = json.load(f)
+            if "sent" not in st:
+                st["sent"] = {}
+            if "positions" not in st:
+                st["positions"] = {}  # positions[symbol] = {"buy_ts":..., "last15m_low":...}
+            return st
     except Exception:
-        return {"sent": {}}  # sent[symbol] = timestamp
+        return {"sent": {}, "positions": {}}
 
 def save_state(st: dict):
     tmp = STATE_FILE + ".tmp"
@@ -190,12 +197,11 @@ def save_state(st: dict):
 
 def tg_send(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        # Telegram sozlanmagan bo'lsa, konsolga chiqaramiz
         print(text)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELELEGRAM_CHAT_ID if False else TELEGRAM_CHAT_ID,  # safety no-op
+        "chat_id": TELELEGRAM_CHAT_ID if False else TELEGRAM_CHAT_ID,  # no-op
         "text": text,
         "disable_web_page_preview": True,
     }
@@ -205,7 +211,6 @@ def tg_send(text: str):
 def passes_confirmation(aw: dict, ad: dict, a4: dict, w_tr: str, d_tr: str, h4_tr: str) -> Tuple[bool, List[str]]:
     reasons = []
 
-    # Core: 1D volume
     vr1d = ad.get("vol_ratio", float("nan"))
     if not math.isnan(vr1d) and vr1d >= VOL_RATIO_MIN_1D:
         reasons.append(f"1D volume spike ~{vr1d:.2f}x (MA20)")
@@ -213,7 +218,6 @@ def passes_confirmation(aw: dict, ad: dict, a4: dict, w_tr: str, d_tr: str, h4_t
         reasons.append(f"1D volume past (~{vr1d:.2f}x), kerak >= {VOL_RATIO_MIN_1D:.2f}x")
         return (False, reasons)
 
-    # 1D breakout (optional)
     if REQUIRE_1D_BREAKOUT:
         if ad.get("breakout") == 1.0:
             reasons.append("1D breakout: prior-high ustida close")
@@ -221,7 +225,6 @@ def passes_confirmation(aw: dict, ad: dict, a4: dict, w_tr: str, d_tr: str, h4_t
             reasons.append("1D breakout yo‘q")
             return (False, reasons)
 
-    # 4H breakout yoki impuls (optional)
     if REQUIRE_4H_BREAKOUT_OR_IMPULSE:
         ok4 = False
         if a4.get("breakout") == 1.0:
@@ -235,7 +238,6 @@ def passes_confirmation(aw: dict, ad: dict, a4: dict, w_tr: str, d_tr: str, h4_t
             reasons.append(f"4H tasdiq yo‘q (breakout/impuls yetarli emas). impulse~{imp:.2f} ATR")
             return (False, reasons)
 
-    # Trend filter: 1D va 4H bearish bo'lmasin
     if "bearish" in d_tr or "bearish" in h4_tr:
         reasons.append(f"Trend filter: 1D={d_tr}, 4H={h4_tr} (bearish) -> skip")
         return (False, reasons)
@@ -253,15 +255,74 @@ def format_buy_message(sym: str, chg24: float, aw: dict, ad: dict, a4: dict, rea
         "Tasdiq sabablari:\n- " + "\n- ".join(reasons)
     )
 
+def format_sell_message(sym: str, cur_price: float, last15_low: float) -> str:
+    return (
+        f"🟥 SELL: {sym}\n"
+        f"Narx 15m oxirgi yopilgan sham LOW’ini kesti.\n"
+        f"Current: {cur_price}\n"
+        f"Last closed 15m LOW: {last15_low}"
+    )
+
+# =========================
+# SELL LOGIC (ADDED)
+# =========================
+def check_sell_positions(state: dict):
+    """
+    BUY bo'lgan coinlar (state['positions']) bo'yicha:
+    - 15m klinesdan oxirgi YOPILGAN shamning LOW'ini oladi (2-oxirgisi).
+    - Current price shu low dan pastga tushsa -> SELL yuboradi va positionni yopadi.
+    """
+    positions = state.get("positions", {})
+    if not positions:
+        return
+
+    to_close = []
+
+    for sym, pos in positions.items():
+        try:
+            raw_15 = klines(sym, "15m", 3)
+            if len(raw_15) < 2:
+                continue
+
+            # Oxirgi yopilgan sham = second last ([-2]),
+            # chunki [-1] hozirgi davom etayotgan bo'lishi mumkin.
+            last_closed_low = to_f(raw_15[-2][3])
+
+            cur = ticker_price(sym)
+
+            # Narx low'ni kessa (<=)
+            if (not math.isnan(cur)) and (not math.isnan(last_closed_low)) and (cur <= last_closed_low):
+                tg_send(format_sell_message(sym, cur, last_closed_low))
+                to_close.append(sym)
+            else:
+                # ixtiyoriy: state ichida oxirgi low ni saqlab qo'yamiz
+                pos["last15m_low"] = last_closed_low
+                positions[sym] = pos
+
+            time.sleep(0.06)
+
+        except Exception as e:
+            print(f"[WARN] SELL-check {sym} error: {e}")
+
+    if to_close:
+        for sym in to_close:
+            positions.pop(sym, None)
+        state["positions"] = positions
+        save_state(state)
+
 # =========================
 # MAIN LOOP
 # =========================
 def run_once(state: dict):
+    # 1) Avval SELL check (BUY bo'lganlardan)
+    check_sell_positions(state)
+
+    # 2) Keyin BUY scan (eski logika o'zgarmagan)
     top = pick_topN_usdt_spot(TOP_N)
 
     for sym, chg24 in top:
         try:
-            # oldin yuborgan bo'lsa qayta yubormaymiz
+            # oldin BUY yuborgan bo'lsa qayta yubormaymiz (eski xulq saqlanadi)
             if sym in state.get("sent", {}):
                 continue
 
@@ -286,21 +347,26 @@ def run_once(state: dict):
             if ok:
                 msg = format_buy_message(sym, chg24, aw, ad, a4, reasons)
                 tg_send(msg)
+
+                # BUY bo'lgani uchun position ochamiz (SELL uchun)
+                state.setdefault("positions", {})[sym] = {
+                    "buy_ts": int(time.time()),
+                    "last15m_low": None,
+                }
+
                 state.setdefault("sent", {})[sym] = int(time.time())
                 save_state(state)
 
-            time.sleep(0.12)  # yumshoq rate-limit
+            time.sleep(0.12)
 
         except Exception as e:
             print(f"[WARN] {sym} error: {e}")
 
 def main():
-    # ogohlantirish (minimal)
     print("NOTE: Bu skript signal beradi, moliyaviy maslahat emas. Risk sizda.")
 
     st = load_state()
 
-    # Telegram yo'q bo'lsa ham ishlaydi (console)
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         print("Telegram ON")
     else:
