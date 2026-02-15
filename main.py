@@ -88,7 +88,7 @@ def sym_state(st: Dict[str, Any], symbol: str) -> Dict[str, Any]:
 
             # BUY2 arm: last closed 1H candle that closed above H4_HIGH
             "buy2_arm_1h_open": None,
-            "buy2_level_high": None,   # that 1h candle HIGH
+            "buy2_level_high": None,   # (CHANGED) now uses H4_HIGH level
 
             # positions
             "pos1_active": False,
@@ -227,7 +227,8 @@ async def refresh_levels(session: aiohttp.ClientSession, st: Dict[str, Any], sym
         # BUY2 arm sharti: 1H candle CLOSE > H4_HIGH
         if ss.get("h4_high") is not None and (h1_cl.close > ss["h4_high"]):
             ss["buy2_arm_1h_open"] = h1_cl.open_time
-            ss["buy2_level_high"] = h1_cl.high
+            # ✅ CHANGED (faqat shu): signalni 1H high emas, H4_HIGH kesilganda beramiz
+            ss["buy2_level_high"] = ss["h4_high"]
 
     # 15m
     m15 = await pull("15m", 5)
@@ -247,7 +248,6 @@ async def handle_signals(session: aiohttp.ClientSession, st: Dict[str, Any], sym
     m15_low = ss.get("m15_low")
 
     # ---- BUY 1 ----
-    # arm bo'lsa, pos1 active bo'lmasa, va narx arm candle high ni kessa -> BUY 1
     if (not ss["pos1_active"]) and ss.get("buy1_arm_4h_open") and ss.get("buy1_level_high"):
         arm_open = ss["buy1_arm_4h_open"]
         level = ss["buy1_level_high"]
@@ -264,10 +264,9 @@ async def handle_signals(session: aiohttp.ClientSession, st: Dict[str, Any], sym
             )
 
     # ---- BUY 2 ----
-    # arm bo'lsa, pos2 active bo'lmasa, va narx arm candle high ni kessa -> BUY 2
     if (not ss["pos2_active"]) and ss.get("buy2_arm_1h_open") and ss.get("buy2_level_high"):
         arm_open = ss["buy2_arm_1h_open"]
-        level = ss["buy2_level_high"]
+        level = ss["buy2_level_high"]  # endi bu H4_HIGH bo'ladi
         if (ss.get("buy2_sent_1h_open") != arm_open) and (price >= level):
             ss["buy2_sent_1h_open"] = arm_open
             ss["pos2_active"] = True
@@ -277,13 +276,12 @@ async def handle_signals(session: aiohttp.ClientSession, st: Dict[str, Any], sym
                 f"✅ BUY 2 | {symbol}\n"
                 f"price={price}\n"
                 f"H4_HIGH={h4_high}\n"
-                f"Break 1H_cand_HIGH={level}"
+                f"Break H4_HIGH={level}"
             )
 
     # ---- SELL (pos1) ----
     if ss["pos1_active"] and m15_low is not None and ss.get("last_15m_open"):
         m15_open = ss["last_15m_open"]
-        # price < last closed 15m low => SELL
         if price < m15_low and ss.get("sell1_sent_15m_open") != m15_open:
             ss["sell1_sent_15m_open"] = m15_open
             ss["pos1_active"] = False
@@ -366,7 +364,7 @@ async def main():
         await tg_send_text(
             session,
             "🚀 Bot started: Top50 gainers | BUY1: (4H close > D1 high) then break 4H high | "
-            "BUY2: (1H close > H4 high) then break 1H high | SELL: price < last closed 15m low"
+            "BUY2: (1H close > H4 high) then break H4_HIGH | SELL: price < last closed 15m low"
         )
 
         tasks = [
