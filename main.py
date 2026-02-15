@@ -13,24 +13,21 @@ load_dotenv()
 # ======================
 # ENV
 # ======================
-TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+# token nomlari bilan muammo bo'lmasin deb ikkisini ham qo'llab-quvvatlaymiz
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
 TOP_N = int(os.getenv("TOP_N") or "50")
 
-SCAN_PRICE_SEC = float(os.getenv("SCAN_PRICE_SEC") or "3")
-REFRESH_TOP_SEC = float(os.getenv("REFRESH_TOP_SEC") or "120")
-REFRESH_KLINES_SEC = float(os.getenv("REFRESH_KLINES_SEC") or "60")
+SCAN_PRICE_SEC = float(os.getenv("SCAN_PRICE_SEC") or "3")           # price poll (tez)
+REFRESH_TOP_SEC = float(os.getenv("REFRESH_TOP_SEC") or "120")       # top gainers refresh
+REFRESH_KLINES_SEC = float(os.getenv("REFRESH_KLINES_SEC") or "45")  # klines refresh
 
+STATE_FILE = os.getenv("STATE_FILE") or "state_buy1_buy2_sell.json"
 BINANCE_BASE = (os.getenv("BINANCE_BASE") or "https://data-api.binance.vision").strip()
 
-NEAR_PCT = float(os.getenv("NEAR_PCT") or "0.01")      # 1% near prior-high
-VOL_SPIKE_X = float(os.getenv("VOL_SPIKE_X") or "1.8") # 1H vol spike vs MA20
-
-STATE_FILE = os.getenv("STATE_FILE") or "state_1h_prepump.json"
-
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID yo'q")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN/TELEGRAM_TOKEN yoki TELEGRAM_CHAT_ID yo'q")
 
 # ======================
 # DATA
@@ -42,11 +39,15 @@ class Candle:
     high: float
     low: float
     close: float
-    volume: float
     close_time: int
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+def last_closed(c: List[Candle]) -> Candle:
+    if len(c) < 2:
+        raise ValueError("Not enough candles")
+    return c[-2]
 
 # ======================
 # STATE
@@ -70,16 +71,36 @@ def sym_state(st: Dict[str, Any], symbol: str) -> Dict[str, Any]:
     s = st["symbols"].get(symbol)
     if not s:
         s = {
-            "last_4h_closed_open": None,
-            "last_1h_closed_open": None,
+            # last closed candle ids
+            "last_1d_open": None,
+            "last_4h_open": None,
+            "last_1h_open": None,
+            "last_15m_open": None,
 
-            "prior_high_4h": None,     # prior high level
-            "last_price": None,
+            # levels from last closed candles
+            "d1_high": None,   # last closed 1D high
+            "h4_high": None,   # last closed 4H high
+            "m15_low": None,   # last closed 15m low
 
-            # staged signals (spam qilmaslik)
-            "setup_sent_for_prior": None,  # prior_high qiymati bilan bog'lab qo'yamiz
-            "ready_sent_for_prior": None,
-            "buy_sent_for_prior": None,
+            # BUY1 arm: last closed 4H candle that closed above D1_HIGH
+            "buy1_arm_4h_open": None,
+            "buy1_level_high": None,   # that 4h candle HIGH
+
+            # BUY2 arm: last closed 1H candle that closed above H4_HIGH
+            "buy2_arm_1h_open": None,
+            "buy2_level_high": None,   # that 1h candle HIGH
+
+            # positions
+            "pos1_active": False,
+            "pos2_active": False,
+
+            # sell gating (avoid spam)
+            "sell1_sent_15m_open": None,
+            "sell2_sent_15m_open": None,
+
+            # buy gating (avoid spam)
+            "buy1_sent_4h_open": None,
+            "buy2_sent_1h_open": None,
         }
         st["symbols"][symbol] = s
     return s
@@ -95,7 +116,7 @@ async def http_get_json(session: aiohttp.ClientSession, url: str, params: Option
 async def tg_send_text(session: aiohttp.ClientSession, text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
-    async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=20)) as r:
+    async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=15)) as r:
         await r.text()
 
 # ======================
@@ -105,7 +126,7 @@ async def get_top_gainers(session: aiohttp.ClientSession, top_n: int) -> List[st
     url = f"{BINANCE_BASE}/api/v3/ticker/24hr"
     data = await http_get_json(session, url)
 
-    usdt = []
+    usdt: List[Tuple[str, float]] = []
     for x in data:
         sym = x.get("symbol", "")
         if not sym.endswith("USDT"):
@@ -134,7 +155,6 @@ async def get_klines(session: aiohttp.ClientSession, symbol: str, interval: str,
             high=float(k[2]),
             low=float(k[3]),
             close=float(k[4]),
-            volume=float(k[5]),
             close_time=int(k[6]),
         ))
     return out
@@ -147,157 +167,144 @@ async def get_price_map(session: aiohttp.ClientSession, symbols: List[str]) -> D
     for x in data:
         sym = x.get("symbol")
         if sym in wanted:
-            mp[sym] = float(x["price"])
+            try:
+                mp[sym] = float(x["price"])
+            except Exception:
+                pass
     return mp
 
-def last_closed(candles: List[Candle]) -> Candle:
-    if len(candles) < 2:
-        raise ValueError("Not enough candles")
-    return candles[-2]
-
 # ======================
-# INDICATORS
+# KLINE REFRESH (cached)
 # ======================
-def true_range(curr: Candle, prev: Candle) -> float:
-    return max(
-        curr.high - curr.low,
-        abs(curr.high - prev.close),
-        abs(curr.low - prev.close),
-    )
-
-def atr14(candles_closed: List[Candle], period: int = 14) -> List[float]:
-    # candles_closed: faqat yopilgan shamlar ketma-ketligi
-    if len(candles_closed) < period + 2:
-        return []
-    trs = []
-    for i in range(1, len(candles_closed)):
-        trs.append(true_range(candles_closed[i], candles_closed[i-1]))
-    # ATR = SMA(TR, period)
-    out = []
-    for i in range(period - 1, len(trs)):
-        window = trs[i - (period - 1): i + 1]
-        out.append(sum(window) / period)
-    return out
-
-def sma(values: List[float], period: int) -> Optional[float]:
-    if len(values) < period:
-        return None
-    return sum(values[-period:]) / period
-
-# ======================
-# CORE LOGIC
-# ======================
-async def refresh_levels(session: aiohttp.ClientSession, st: Dict[str, Any], symbol: str) -> None:
+async def refresh_levels(session: aiohttp.ClientSession, st: Dict[str, Any], symbol: str, cache: Dict[str, Any]) -> None:
     ss = sym_state(st, symbol)
+    tnow = now_ms()
 
-    # 4H klines (prior-high + ATR squeeze)
-    k4 = await get_klines(session, symbol, "4h", 200)
-    closed4 = k4[:-1]  # forming candle chiqib ketadi
-    if len(closed4) < 30:
-        return
+    async def pull(interval: str, limit: int) -> List[Candle]:
+        key = f"{symbol}:{interval}"
+        ent = cache.get(key)
+        if ent and (tnow - ent["t"] < int(REFRESH_KLINES_SEC * 1000)):
+            return ent["candles"]
+        c = await get_klines(session, symbol, interval, limit)
+        cache[key] = {"t": tnow, "candles": c}
+        return c
 
-    last4 = closed4[-1]
-    if ss["last_4h_closed_open"] != last4.open_time:
-        ss["last_4h_closed_open"] = last4.open_time
+    # 1D
+    d = await pull("1d", 5)
+    d_cl = last_closed(d)
+    if ss["last_1d_open"] != d_cl.open_time:
+        ss["last_1d_open"] = d_cl.open_time
+        ss["d1_high"] = d_cl.high
 
-        # prior high = oldingi high'lar ichidan (last closed'dan oldingi) maximum
-        prior_high = max(c.high for c in closed4[:-1])
-        ss["prior_high_4h"] = prior_high
+        # 1D yangilanganda BUY1 arm qayta quriladi (pos1 yopiq bo'lsa)
+        ss["buy1_arm_4h_open"] = None
+        ss["buy1_level_high"] = None
+        ss["buy1_sent_4h_open"] = None
 
-        # prior_high o'zgarsa staged signal reset (spam emas, yangi setup)
-        ss["setup_sent_for_prior"] = None
-        ss["ready_sent_for_prior"] = None
-        ss["buy_sent_for_prior"] = None
+    # 4H
+    h4 = await pull("4h", 5)
+    h4_cl = last_closed(h4)
+    if ss["last_4h_open"] != h4_cl.open_time:
+        ss["last_4h_open"] = h4_cl.open_time
+        ss["h4_high"] = h4_cl.high
 
-    # 1H klines (volume spike)
-    k1 = await get_klines(session, symbol, "1h", 80)
-    closed1 = k1[:-1]
-    if len(closed1) < 30:
-        return
+        # BUY1 arm sharti: 4H candle CLOSE > D1_HIGH
+        if ss.get("d1_high") is not None and (h4_cl.close > ss["d1_high"]):
+            ss["buy1_arm_4h_open"] = h4_cl.open_time
+            ss["buy1_level_high"] = h4_cl.high
 
-    last1 = closed1[-1]
-    ss["last_1h_closed_open"] = last1.open_time
+        # BUY2 armni ham yangilashga ta'sir qiladi (H4_HIGH yangilandi)
+        ss["buy2_arm_1h_open"] = None
+        ss["buy2_level_high"] = None
+        ss["buy2_sent_1h_open"] = None
 
-    # cache ichida saqlab qo'yamiz (handle_signals tez bo'lsin)
-    ss["_closed4_len"] = len(closed4)
-    ss["_closed1_len"] = len(closed1)
+    # 1H
+    h1 = await pull("1h", 5)
+    h1_cl = last_closed(h1)
+    if ss["last_1h_open"] != h1_cl.open_time:
+        ss["last_1h_open"] = h1_cl.open_time
 
-    # ATR squeeze baholash uchun ATR ro'yxatini saqlaymiz
-    atrs = atr14(closed4, 14)
-    ss["_atr_list"] = atrs
+        # BUY2 arm sharti: 1H candle CLOSE > H4_HIGH
+        if ss.get("h4_high") is not None and (h1_cl.close > ss["h4_high"]):
+            ss["buy2_arm_1h_open"] = h1_cl.open_time
+            ss["buy2_level_high"] = h1_cl.high
 
-    # 1H volume list
-    ss["_vol1_list"] = [c.volume for c in closed1]
+    # 15m
+    m15 = await pull("15m", 5)
+    m15_cl = last_closed(m15)
+    if ss["last_15m_open"] != m15_cl.open_time:
+        ss["last_15m_open"] = m15_cl.open_time
+        ss["m15_low"] = m15_cl.low
 
+# ======================
+# SIGNAL LOGIC
+# ======================
 async def handle_signals(session: aiohttp.ClientSession, st: Dict[str, Any], symbol: str, price: float) -> None:
     ss = sym_state(st, symbol)
-    ss["last_price"] = price
 
-    prior_high = ss.get("prior_high_4h")
-    if not prior_high:
-        return
+    d1_high = ss.get("d1_high")
+    h4_high = ss.get("h4_high")
+    m15_low = ss.get("m15_low")
 
-    # ---------- 1) SETUP: 4H squeeze (ATR low) ----------
-    atrs: List[float] = ss.get("_atr_list") or []
-    if atrs:
-        # last ATR
-        last_atr = atrs[-1]
-        # threshold: bottom 20% of last 50 atr values
-        window = atrs[-50:] if len(atrs) >= 50 else atrs[:]
-        if len(window) >= 20:
-            sorted_w = sorted(window)
-            idx = max(0, int(len(sorted_w) * 0.20) - 1)
-            thr = sorted_w[idx]
-
-            # squeeze = last_atr <= thr
-            if last_atr <= thr:
-                if ss.get("setup_sent_for_prior") != prior_high:
-                    ss["setup_sent_for_prior"] = prior_high
-                    await tg_send_text(
-                        session,
-                        f"🟨 SETUP (4H squeeze)\n"
-                        f"{symbol}\n"
-                        f"prior_high_4h={prior_high}\n"
-                        f"ATR14={last_atr:.6f} (low volatility)"
-                    )
-
-    # ---------- 2) READY: near prior-high + 1H vol spike ----------
-    near_level = prior_high * (1.0 - NEAR_PCT)
-    is_near = (price >= near_level) and (price < prior_high)
-
-    vol_list: List[float] = ss.get("_vol1_list") or []
-    vol_ma20 = sma(vol_list, 20)
-    vol_last = vol_list[-1] if vol_list else None
-    vol_spike = False
-    vol_ratio = None
-    if vol_ma20 and vol_last is not None and vol_ma20 > 0:
-        vol_ratio = vol_last / vol_ma20
-        vol_spike = vol_ratio >= VOL_SPIKE_X
-
-    if is_near and vol_spike:
-        if ss.get("ready_sent_for_prior") != prior_high:
-            ss["ready_sent_for_prior"] = prior_high
-            remain_pct = (prior_high - price) / prior_high * 100.0
+    # ---- BUY 1 ----
+    # arm bo'lsa, pos1 active bo'lmasa, va narx arm candle high ni kessa -> BUY 1
+    if (not ss["pos1_active"]) and ss.get("buy1_arm_4h_open") and ss.get("buy1_level_high"):
+        arm_open = ss["buy1_arm_4h_open"]
+        level = ss["buy1_level_high"]
+        if (ss.get("buy1_sent_4h_open") != arm_open) and (price >= level):
+            ss["buy1_sent_4h_open"] = arm_open
+            ss["pos1_active"] = True
+            ss["sell1_sent_15m_open"] = None
             await tg_send_text(
                 session,
-                f"🟦 READY (near breakout + 1H vol spike)\n"
-                f"{symbol}\n"
+                f"✅ BUY 1 | {symbol}\n"
                 f"price={price}\n"
-                f"prior_high_4h={prior_high}\n"
-                f"remaining={remain_pct:.2f}% (near={NEAR_PCT*100:.2f}%)\n"
-                f"1H vol spike={vol_ratio:.2f}x (target {VOL_SPIKE_X}x)"
+                f"D1_HIGH={d1_high}\n"
+                f"Break 4H_cand_HIGH={level}"
             )
 
-    # ---------- 3) BUY: price breaks prior-high ----------
-    if price >= prior_high:
-        if ss.get("buy_sent_for_prior") != prior_high:
-            ss["buy_sent_for_prior"] = prior_high
+    # ---- BUY 2 ----
+    # arm bo'lsa, pos2 active bo'lmasa, va narx arm candle high ni kessa -> BUY 2
+    if (not ss["pos2_active"]) and ss.get("buy2_arm_1h_open") and ss.get("buy2_level_high"):
+        arm_open = ss["buy2_arm_1h_open"]
+        level = ss["buy2_level_high"]
+        if (ss.get("buy2_sent_1h_open") != arm_open) and (price >= level):
+            ss["buy2_sent_1h_open"] = arm_open
+            ss["pos2_active"] = True
+            ss["sell2_sent_15m_open"] = None
             await tg_send_text(
                 session,
-                f"✅ BUY (breakout)\n"
-                f"{symbol}\n"
+                f"✅ BUY 2 | {symbol}\n"
                 f"price={price}\n"
-                f"broke prior_high_4h={prior_high}"
+                f"H4_HIGH={h4_high}\n"
+                f"Break 1H_cand_HIGH={level}"
+            )
+
+    # ---- SELL (pos1) ----
+    if ss["pos1_active"] and m15_low is not None and ss.get("last_15m_open"):
+        m15_open = ss["last_15m_open"]
+        # price < last closed 15m low => SELL
+        if price < m15_low and ss.get("sell1_sent_15m_open") != m15_open:
+            ss["sell1_sent_15m_open"] = m15_open
+            ss["pos1_active"] = False
+            await tg_send_text(
+                session,
+                f"🟥 SELL (from BUY 1) | {symbol}\n"
+                f"price={price}\n"
+                f"last_closed_15m_LOW={m15_low}"
+            )
+
+    # ---- SELL (pos2) ----
+    if ss["pos2_active"] and m15_low is not None and ss.get("last_15m_open"):
+        m15_open = ss["last_15m_open"]
+        if price < m15_low and ss.get("sell2_sent_15m_open") != m15_open:
+            ss["sell2_sent_15m_open"] = m15_open
+            ss["pos2_active"] = False
+            await tg_send_text(
+                session,
+                f"🟥 SELL (from BUY 2) | {symbol}\n"
+                f"price={price}\n"
+                f"last_closed_15m_LOW={m15_low}"
             )
 
 # ======================
@@ -309,16 +316,14 @@ async def loop_refresh_top(session: aiohttp.ClientSession, st: Dict[str, Any]) -
             syms = await get_top_gainers(session, TOP_N)
             st["top_symbols"] = syms
             st["last_top_refresh_ms"] = now_ms()
-
-            # Telegramga yubormaymiz (faqat log)
-            print(f"✅ Top {TOP_N} gainers updated. Tracking: {len(syms)}")
-
+            # bu xabarni xohlasang o'chirib tashlashing mumkin, lekin kod ishlashi davom etadi
+            await tg_send_text(session, f"✅ Top {TOP_N} gainers updated. Tracking: {len(syms)}")
             save_state(st)
         except Exception as e:
             await tg_send_text(session, f"⚠️ Top refresh error: {type(e).__name__}: {e}")
         await asyncio.sleep(REFRESH_TOP_SEC)
 
-async def loop_refresh_klines(session: aiohttp.ClientSession, st: Dict[str, Any]) -> None:
+async def loop_refresh_klines(session: aiohttp.ClientSession, st: Dict[str, Any], cache: Dict[str, Any]) -> None:
     while True:
         syms = st.get("top_symbols") or []
         if not syms:
@@ -326,9 +331,9 @@ async def loop_refresh_klines(session: aiohttp.ClientSession, st: Dict[str, Any]
             continue
         for symbol in syms:
             try:
-                await refresh_levels(session, st, symbol)
+                await refresh_levels(session, st, symbol, cache)
             except Exception as e:
-                print("refresh_levels error", symbol, e)
+                print("kline refresh error", symbol, e)
         save_state(st)
         await asyncio.sleep(REFRESH_KLINES_SEC)
 
@@ -352,18 +357,21 @@ async def loop_prices(session: aiohttp.ClientSession, st: Dict[str, Any]) -> Non
 
 async def main():
     st = load_state()
+    cache: Dict[str, Any] = {}
 
     timeout = aiohttp.ClientTimeout(total=20)
-    connector = aiohttp.TCPConnector(limit=60, ssl=False)
+    connector = aiohttp.TCPConnector(limit=80, ssl=False)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         await tg_send_text(
             session,
-            "🚀 Bot started (1H pre-pump): Top50 gainers -> 4H prior-high + 4H squeeze -> READY (near + 1H vol spike) -> BUY (break)"
+            "🚀 Bot started: Top50 gainers | BUY1: (4H close > D1 high) then break 4H high | "
+            "BUY2: (1H close > H4 high) then break 1H high | SELL: price < last closed 15m low"
         )
+
         tasks = [
             asyncio.create_task(loop_refresh_top(session, st)),
-            asyncio.create_task(loop_refresh_klines(session, st)),
+            asyncio.create_task(loop_refresh_klines(session, st, cache)),
             asyncio.create_task(loop_prices(session, st)),
         ]
         await asyncio.gather(*tasks)
